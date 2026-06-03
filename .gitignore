@@ -1,0 +1,11 @@
+output/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.claude/
+
+# Config files (keep example)
+config.yaml
+config.*.yaml
+!config.example.yaml

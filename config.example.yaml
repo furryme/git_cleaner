@@ -1,0 +1,160 @@
+# Git Cleaner - Configuration Template
+# Copy this to config.yaml and customize for your project
+
+# Source repository (local path to the internal git repo)
+source_repo: "./internal_repo"
+
+# Output directory for the cleaned repository
+output_dir: "./cleaned_repo"
+
+# === Sanitize: Remove sensitive information ===
+sanitize:
+  enabled: true
+
+  # Email replacements: internal_email -> public_email
+  email_replacements:
+    ".*@internal\\.company\\.com": "contributor@opensource.example.com"
+    ".*@company\\.corp": "contributor@opensource.example.com"
+    "zhangsan_dxm@internal.company.com": "zhangsan@opensource.example.com"
+
+  # Strings to redact from commit messages and file contents
+  # Supports regex patterns
+  redact_patterns:
+    # Internal machine names
+    - pattern: "prod-[a-z0-9]+\\.internal\\.company\\.com"
+      replacement: "[internal-server]"
+    - pattern: "build-[0-9]+\\.corp\\.local"
+      replacement: "[build-server]"
+    # Internal file paths
+    - pattern: "/data/internal/[^\\s]+"
+      replacement: "[internal-path]"
+    - pattern: "/mnt/nfs/[^\\s]+"
+      replacement: "[nfs-path]"
+    # Internal URLs
+    - pattern: "https?://[^\\s]*\\.internal\\.company\\.com[^\\s]*"
+      replacement: "[internal-url]"
+    - pattern: "https?://[^\\s]*\\.corp\\.local[^\\s]*"
+      replacement: "[corp-url]"
+    # IP addresses (internal ranges)
+    - pattern: "10\\.[0-9]+\\.[0-9]+\\.[0-9]+"
+      replacement: "[internal-ip]"
+    - pattern: "172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]+\\.[0-9]+"
+      replacement: "[internal-ip]"
+    - pattern: "192\\.168\\.[0-9]+\\.[0-9]+"
+      replacement: "[internal-ip]"
+    # JWT tokens / API keys
+    - pattern: "eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+"
+      replacement: "[redacted-token]"
+    - pattern: "[A-Za-z0-9]{32,}(?:-key|-secret|-token)"
+      replacement: "[redacted-key]"
+
+  # Files to exclude entirely (gitignore-style patterns)
+  exclude_files:
+    - ".env*"
+    - "*credentials*"
+    - "*secret*"
+    - "*.pem"
+    - "*.key"
+    - "config/local*"
+    - "**/__secret__/**"
+
+# === Copyright: Add headers to source files ===
+copyright:
+  enabled: true
+  # Copyright text template
+  # Variables: {year}, {author}, {organization}
+  text: "Copyright {year}-{current_year} {author}. All rights reserved."
+  author: "The Project Authors"
+  organization: "Project Organization"
+  year: "2024"
+
+  # License header file to use (one of: mit, apache2, bsd3, bsd2, gpl3,mozilla2)
+  # Or provide a custom header file path
+  license_header: "mit"
+  # custom_header_file: "./templates/custom_header.txt"
+
+  # File extensions to add headers to
+  file_extensions:
+    - ".go"
+    - ".py"
+    - ".js"
+    - ".ts"
+    - ".tsx"
+    - ".jsx"
+    - ".java"
+    - ".cpp"
+    - ".c"
+    - ".h"
+    - ".rs"
+    - ".rb"
+    - ".sh"
+    - ".yaml"
+    - ".yml"
+
+# === License: Add project-level files ===
+license:
+  enabled: true
+  # License type: mit, apache2, bsd3, bsd2, gpl3, mpl2, agpl3
+  license_type: "mit"
+  # License holder name
+  holder: "The Project Authors"
+  # Year for the license
+  year: "2024"
+
+  # Additional files to generate
+  generate_readme: true
+  generate_codeowners: false
+  generate_prtemplate: true
+
+  # Custom values for readme generation
+  readme:
+    project_name: "Project Name"
+    project_badge: true
+    description: "A brief description of the project"
+    installation_section: true
+    usage_section: true
+    contributing_section: true
+
+# === History: Simplify git history ===
+history:
+  enabled: true
+
+  # Strategy: "simplify" | "squash-ranges" | "linearize" | "rewrite-only"
+  # simplify: auto-squash obvious fixup/wip commits, rewrite messages
+  # squash-ranges: manually specify commit ranges to squash
+  # linearize: rebase onto a linear history (drop merge commits)
+  # rewrite-only: only rewrite commit messages, keep all commits
+  strategy: "simplify"
+
+  # Auto-squash commits matching these message patterns (group with previous commit)
+  squash_patterns:
+    - "^fixup!"
+    - "^squash!"
+    - "^wip"
+    - "^temp"
+    - "^draft"
+    - "^revert:"
+    - "merge branch"
+    - "^auto-merged"
+
+  # Commit message rewrites - replace patterns in commit messages
+  message_rewrites:
+    - pattern: "JIRA-[0-9]+"
+      replacement: "[issue]"
+    - pattern: "PR #[0-9]+"
+      replacement: "[pr]"
+    - pattern: "internal-[a-z0-9-]+"
+      replacement: "[internal-ref]"
+    - pattern: "PROD-[0-9]+"
+      replacement: "[ticket]"
+
+  # Force commit message to be in a specific language
+  # (uses translation if enabled, set to "en" or "zh")
+  message_language: null
+
+  # Author info overrides
+  author_name: "Developer"
+  author_email: "developer@opensource.example.com"
+
+  # After N commits, force a tag checkpoint
+  tag_prefix: "v"
