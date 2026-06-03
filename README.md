@@ -59,7 +59,7 @@ sanitize:
     - "*.tar.gz"
 ```
 
-**历史重写**同时修改 git 提交中的作者信息（`history.author_name` / `author_email`）和提交信息中的敏感内容。
+**历史重写**遍历每个 commit 的 tree，对其中所有 blob 应用脱敏规则后再通过 `commit-tree` 重建 commit。脱敏后的旧对象会被 `gc --aggressive` 彻底清除，`git log -p` 中不会残留敏感信息。同时修改作者信息（`history.author_name` / `author_email`）和提交信息中的敏感内容。
 
 ### history — 历史简化
 
@@ -138,9 +138,9 @@ git-cleaner [OPTIONS]
 ## 注意事项
 
 - **原始仓库安全**：工具先克隆再处理，源仓库不会被修改
-- **大仓库**：历史重写（cherry-pick/commit-tree）对大仓库可能需要较长时间
+- **大仓库**：历史重写（commit-tree + blob 过滤）对大仓库可能需要较长时间。工具会预扫描所有唯一 blob 并缓存结果，避免重复处理
+- **旧对象清理**：脱敏后通过 `reflog expire` + `gc --aggressive` 彻底清除不可达的旧对象，`git log -p` 中不会残留敏感信息
 - **分支处理**：默认只重写 `main/master`，其余内部分支会被删除。如需保留特定分支，请在配置中调整 `history` 策略
-- **git-filter-repo**：如果安装了 [git-filter-repo](https://github.com/newren/git-filter-repo)，内容替换速度会更快；未安装时自动回退到内置方案
 
 ## 示例
 
