@@ -229,10 +229,11 @@ def _final_cleanup(repo_path, config):
             )
             logger.info(f"Removed orphan tag: {tag_name} (commit {tag_commit[:7]} not reachable)")
 
-    # Clean reflogs
+    # Clean reflogs and prune unreachable objects (including old sensitive blobs)
     try:
         repo.git.reflog("expire", "--expire=all", "--all")
-        repo.git.gc("--prune=now")
+        repo.git.gc("--prune=now", "--aggressive")
+        logger.info("Final garbage collection complete — unreachable objects pruned")
     except Exception as e:
         logger.debug(f"Final gc warning: {e}")
 

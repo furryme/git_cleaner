@@ -117,7 +117,7 @@ def _dry_run(config):
 
     # Count files
     tree = repo.tree("HEAD")
-    file_count = sum(1 for _ in tree.traverse() if getattr(_.type, "sha", None) == "blob")
+    file_count = sum(1 for _ in tree.traverse() if _.type == "blob")
     print(f"Files: {file_count}")
 
     # What would be sanitized

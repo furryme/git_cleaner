@@ -3,13 +3,152 @@
 import logging
 import os
 import re
+import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 from git import Repo
 
 logger = logging.getLogger(__name__)
+
+
+def _write_blob(repo_path, content_bytes):
+    """Write content as a blob and return its SHA."""
+    result = subprocess.run(
+        ["git", "-C", repo_path, "hash-object", "-w", "--stdin"],
+        input=content_bytes, capture_output=True,
+    )
+    return result.stdout.decode().strip()
+
+
+def _filter_blob(repo_path, sha, subs):
+    """Apply substitutions to a blob. Return new SHA, or None if unchanged."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "cat-file", "-s", sha],
+            capture_output=True, text=True,
+        )
+        size = int(result.stdout.strip())
+        if size > 100 * 1024 * 1024:
+            return None
+    except Exception:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "cat-file", "-p", sha],
+            capture_output=True,
+        )
+        raw = result.stdout
+    except Exception:
+        return None
+    if b"\x00" in memoryview(raw)[:8192]:
+        return None
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    original = text
+    for regex, replacement in subs:
+        text = regex.sub(replacement, text)
+    if text == original:
+        return None
+    return _write_blob(repo_path, text.encode("utf-8"))
+
+
+def _filter_tree(repo_path, tree_sha, subs, exclude_patterns, blob_map=None):
+    """Filter a tree, replacing blobs and removing excluded entries.
+    Uses git update-index --cacheinfo + write-tree for reliable tree creation.
+    When blob_map is provided, uses pre-computed mappings for speed.
+    Return new tree SHA, or None if tree is unchanged.
+    """
+    result = subprocess.run(
+        ["git", "-C", repo_path, "ls-tree", "-r", tree_sha],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    lines = result.stdout.strip().split("\n")
+    if not lines or lines == [""]:
+        return None
+
+    # Build cacheinfo entries and track changes
+    adds = []    # (mode, sha, path) for entries to add
+    changed = False
+
+    for line in lines:
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        meta, pathname = parts
+        mode, _, _sha = meta.split(" ", 2)
+
+        # Skip excluded entries
+        if should_exclude_file(pathname, exclude_patterns):
+            changed = True
+            continue
+
+        # Only filter blobs
+        if not mode.startswith("100"):
+            adds.append((mode, _sha, pathname))
+            continue
+
+        # Use pre-computed blob_map if available, otherwise filter on-the-fly
+        if blob_map:
+            new_sha = blob_map.get(_sha)
+        else:
+            new_sha = _filter_blob(repo_path, _sha, subs)
+        if new_sha and new_sha != _sha:
+            changed = True
+        adds.append((mode, new_sha or _sha, pathname))
+
+    if not changed:
+        return None
+
+    # Use read-tree + update-index + write-tree with index swap
+    idx_path = Path(repo_path) / ".git" / "index"
+    backup_path = Path(repo_path) / ".git" / "index.cleaner_bak"
+
+    try:
+        # Save current index
+        if idx_path.exists():
+            shutil.copy2(str(idx_path), str(backup_path))
+        else:
+            backup_path = None
+
+        # Load the tree into the index
+        subprocess.run(
+            ["git", "-C", repo_path, "read-tree", tree_sha],
+            capture_output=True,
+        )
+
+        # Update entries with filtered blob SHAs
+        for mode, sha, path in adds:
+            subprocess.run(
+                ["git", "-C", repo_path, "update-index", "--cacheinfo",
+                 f"{mode},{sha},{path}"],
+                capture_output=True,
+            )
+
+        # Write the filtered tree
+        result = subprocess.run(
+            ["git", "-C", repo_path, "write-tree"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.debug(f"write-tree failed: {result.stderr[:200]}")
+            return None
+        return result.stdout.strip()
+
+    finally:
+        # Restore original index
+        if backup_path:
+            shutil.copy2(str(backup_path), str(idx_path))
+            backup_path.unlink(missing_ok=True)
+        elif idx_path.exists():
+            idx_path.unlink()
 
 
 def should_exclude_file(filepath, exclude_patterns):
@@ -34,6 +173,50 @@ def should_exclude_file(filepath, exclude_patterns):
             if re.match(regex, filepath):
                 return True
     return False
+
+
+def _build_blob_map(repo_path, blob_shas, subs, exclude_patterns):
+    """Scan blobs and return {old_sha: new_sha} for those needing cleaning."""
+    if not blob_shas or not subs:
+        return None
+
+    # Collect unique (sha, path) pairs for dedup
+    seen = set()
+    to_scan = []
+    for sha in blob_shas:
+        if sha not in seen:
+            seen.add(sha)
+            to_scan.append(sha)
+
+    blob_map = {}
+    scanned = 0
+    for sha in to_scan:
+        new_sha = _filter_blob(repo_path, sha, subs)
+        if new_sha:
+            blob_map[sha] = new_sha
+        scanned += 1
+
+    if blob_map:
+        logger.info(f"Blob content filter: {len(blob_map)}/{scanned} unique blobs need cleaning (of {len(blob_shas)} total)")
+    else:
+        logger.info(f"Blob content filter: no blobs need cleaning (scanned {scanned})")
+    return blob_map or None
+
+
+def _finalize_object_store(repo_path):
+    """Expire reflogs and garbage-collect unreachable objects (old sensitive blobs)."""
+    try:
+        subprocess.run(
+            ["git", "-C", repo_path, "reflog", "expire", "--expire=all", "--all"],
+            capture_output=True, check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repo_path, "gc", "--prune=now", "--aggressive"],
+            capture_output=True, check=True, timeout=300,
+        )
+        logger.info("Pruned unreachable objects from object store")
+    except Exception as e:
+        logger.warning(f"Object store cleanup warning: {e}")
 
 
 def commit_with_author(repo_path, message, config):
@@ -63,18 +246,37 @@ def run_sanitize(repo_path, config):
 
     repo = Repo(repo_path)
 
-    # 1. Rewrite git history with filter-branch (authors + commit messages)
-    _rewrite_history(repo_path, repo, config)
+    # Build content substitution patterns for tree filtering
+    email_map = sanitize_cfg.get("email_replacements", {})
+    redact_patterns = sanitize_cfg.get("redact_patterns", [])
+    exclude_patterns = sanitize_cfg.get("exclude_files", [])
 
-    # 2. Clean file contents in the working tree (current HEAD)
+    subs = []
+    for pattern, replacement in email_map.items():
+        subs.append((re.compile(pattern), replacement))
+    for p in redact_patterns:
+        pat = p.get("pattern", "")
+        rep = p.get("replacement", "")
+        if pat:
+            subs.append((re.compile(pat), rep))
+
+    # 1. Rewrite git history — filters blob content through commit-tree
+    _rewrite_history(repo_path, repo, config, subs=subs or None, exclude_patterns=exclude_patterns or None)
+
+    # 2. Clean any remaining dirty content in the working tree
+    # (safety net for edge cases and when history rewrite skips content filtering)
     _clean_working_tree_contents(repo_path, sanitize_cfg, config)
 
     # 3. Remove excluded files from working tree
     _remove_excluded_files(repo_path, sanitize_cfg, config)
 
 
-def _rewrite_history(repo_path, repo, config):
-    """Rewrite author info and commit messages using cherry-pick + amend."""
+def _rewrite_history(repo_path, repo, config, subs=None, exclude_patterns=None):
+    """Rewrite author info, commit messages, and optionally filter blob content.
+
+    When subs/exclude_patterns are provided, each commit's tree is rebuilt
+    with sensitive blobs replaced — the source is never modified.
+    """
     sanitize_cfg = config["sanitize"]
     history_cfg = config["history"]
 
@@ -85,8 +287,9 @@ def _rewrite_history(repo_path, repo, config):
     msg_redact = [p for p in sanitize_cfg.get("redact_patterns", [])]
 
     if not (author_name or author_email or email_replacements or msg_rewrites or msg_redact):
-        logger.info("No history rewriting needed")
-        return
+        if not subs:
+            logger.info("No history rewriting needed")
+            return
 
     # Build email map from all unique emails in history
     email_map = {}
@@ -105,8 +308,9 @@ def _rewrite_history(repo_path, repo, config):
                 email_map[orig] = mapped
 
     if not email_map and not msg_rewrites and not msg_redact:
-        logger.info("No history rewriting needed")
-        return
+        if not subs:
+            logger.info("No history rewriting needed")
+            return
 
     import shutil
 
@@ -141,6 +345,18 @@ def _rewrite_history(repo_path, repo, config):
     env = os.environ.copy()
     parent_map = {}  # old_sha -> new_sha
 
+    # Pre-collect all unique blobs across the history for content filtering
+    blob_map = None
+    if subs:
+        all_blob_shas = set()
+        for commit in all_commits:
+            tree = commit.tree
+            for item in tree.traverse():
+                t = item.type
+                if t == "blob" or (not isinstance(t, str) and getattr(t, "name", None) == "blob"):
+                    all_blob_shas.add(item.hexsha)
+        blob_map = _build_blob_map(repo_path, all_blob_shas, subs, exclude_patterns or [])
+
     try:
         for i, commit in enumerate(all_commits):
             # Map author
@@ -162,6 +378,17 @@ def _rewrite_history(repo_path, repo, config):
             author_str = f'{a_name} <{a_email}>'
             committer_str = f'{c_name} <{c_email}>'
 
+            # Filter tree content: rebuild with cleaned blobs
+            tree_sha = commit.tree.hexsha
+            if blob_map:
+                try:
+                    filtered = _filter_tree(repo_path, tree_sha, subs, exclude_patterns or [],
+                                           blob_map=blob_map)
+                    if filtered:
+                        tree_sha = filtered
+                except Exception as e:
+                    logger.debug(f"Tree filter warning at commit {i}: {e}")
+
             commit_env = env.copy()
             commit_env.update({
                 "GIT_AUTHOR_NAME": a_name,
@@ -172,7 +399,7 @@ def _rewrite_history(repo_path, repo, config):
                 "GIT_COMMITTER_DATE": _format_git_date(commit.committed_datetime),
             })
 
-            cmd = ["git", "-C", repo_path, "commit-tree", commit.tree.hexsha]
+            cmd = ["git", "-C", repo_path, "commit-tree", tree_sha]
             for p_sha in parent_shas:
                 cmd.extend(["-p", p_sha])
 
@@ -250,6 +477,10 @@ def _rewrite_history(repo_path, repo, config):
 
     # Update tags to point to rewritten commits (annotated tags need recreation)
     _update_tags(repo_path, parent_map)
+
+    # Prune old sensitive blobs that are no longer referenced by the rewritten history
+    if blob_map:
+        _finalize_object_store(repo_path)
 
 
 def _format_git_date(dt):
