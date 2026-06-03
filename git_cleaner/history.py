@@ -283,7 +283,7 @@ def clean_reflogs(repo_path):
     """Clean up reflog and orphaned references."""
     repo = Repo(repo_path)
     try:
-        repo.git.reflog("--expire-all", "--all")
+        repo.git.reflog("expire", "--expire=all", "--all")
         repo.git.gc("--prune=now")
         logger.info("Cleaned reflogs and ran gc")
     except Exception as e:

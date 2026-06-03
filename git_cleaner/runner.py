@@ -189,19 +189,52 @@ def _final_cleanup(repo_path, config):
         repo.delete_branch(branch, "-D")
         logger.info(f"Removed backup branch: {branch.name}")
 
-    # Clean reflogs
+    # Remove origin remote (points to uncleaned source)
     try:
-        repo.git.reflog("--expire-all", "--all")
-        repo.git.gc("--prune=now")
-    except Exception as e:
-        logger.debug(f"Final gc warning: {e}")
+        subprocess.run(
+            ["git", "-C", repo_path, "remote", "remove", "origin"],
+            capture_output=True,
+        )
+        logger.info("Removed origin remote")
+    except Exception:
+        pass
 
-    # Remove .git/filter_branch (filter-branch backup)
-    fb_dir = Path(repo_path) / ".git" / "refs" / "stash"
+    # Remove filter-branch backup refs
     orig_refs = Path(repo_path) / ".git" / "refs" / "original"
     if orig_refs.exists():
         shutil.rmtree(orig_refs)
-        logger.info("Removed filter-branch original refs")
+        logger.info("Removed refs/original backup")
+
+    # Remove tags pointing to unreachable commits (from other cloned branches)
+    tag_result = subprocess.run(
+        ["git", "-C", repo_path, "tag", "-l"],
+        capture_output=True, text=True,
+    )
+    for tag_name in tag_result.stdout.strip().split("\n"):
+        if not tag_name:
+            continue
+        commit_result = subprocess.run(
+            ["git", "-C", repo_path, "rev-list", "-n", "1", tag_name],
+            capture_output=True, text=True,
+        )
+        tag_commit = commit_result.stdout.strip()
+        ancestor_result = subprocess.run(
+            ["git", "-C", repo_path, "merge-base", "--is-ancestor", tag_commit, "HEAD"],
+            capture_output=True,
+        )
+        if ancestor_result.returncode != 0:
+            subprocess.run(
+                ["git", "-C", repo_path, "tag", "-d", tag_name],
+                capture_output=True,
+            )
+            logger.info(f"Removed orphan tag: {tag_name} (commit {tag_commit[:7]} not reachable)")
+
+    # Clean reflogs
+    try:
+        repo.git.reflog("expire", "--expire=all", "--all")
+        repo.git.gc("--prune=now")
+    except Exception as e:
+        logger.debug(f"Final gc warning: {e}")
 
     # Print final stats
     total_commits = len(list(repo.iter_commits("HEAD")))

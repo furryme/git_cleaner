@@ -263,7 +263,8 @@ def add_copyright_headers(repo_path, config):
         logger.info(f"Added copyright headers to {len(modified)} files")
         # Stage and commit
         repo.index.add(modified)
-        repo.index.commit("Add copyright headers to source files")
+        from .sanitize import commit_with_author
+        commit_with_author(repo_path, "Add copyright headers to source files", config)
     else:
         logger.info("No files needed copyright headers")
 
@@ -279,8 +280,10 @@ def _is_excluded(filepath, base, config):
     if should_exclude_file(rel, exclude):
         return True
 
-    # Skip vendor/node_modules/etc
-    skip_dirs = {"node_modules", "vendor", ".git", "__pycache__", "venv", ".venv"}
+    # Skip vendor/node_modules/etc and user-configured directories
+    skip_dirs = {".git", "__pycache__", "venv", ".venv", "node_modules", "vendor"}.union(
+        config.get("copyright", {}).get("skip_dirs", []),
+    )
     for part in filepath.parts:
         if part in skip_dirs:
             return True

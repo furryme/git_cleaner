@@ -36,6 +36,24 @@ def should_exclude_file(filepath, exclude_patterns):
     return False
 
 
+def commit_with_author(repo_path, message, config):
+    """Commit using the sanitized author identity from config.
+
+    Avoids leaking the local git config identity into the cleaned repo.
+    """
+    env = os.environ.copy()
+    hist = config.get("history", {})
+    env["GIT_AUTHOR_NAME"] = hist.get("author_name", "Developer")
+    env["GIT_AUTHOR_EMAIL"] = hist.get("author_email", "developer@example.com")
+    env["GIT_COMMITTER_NAME"] = env["GIT_AUTHOR_NAME"]
+    env["GIT_COMMITTER_EMAIL"] = env["GIT_AUTHOR_EMAIL"]
+
+    subprocess.run(
+        ["git", "-C", repo_path, "commit", "-m", message],
+        env=env, check=True, capture_output=True,
+    )
+
+
 def run_sanitize(repo_path, config):
     """Run sanitization: rewrite history (authors, messages) then clean file contents."""
     sanitize_cfg = config["sanitize"]
@@ -49,10 +67,10 @@ def run_sanitize(repo_path, config):
     _rewrite_history(repo_path, repo, config)
 
     # 2. Clean file contents in the working tree (current HEAD)
-    _clean_working_tree_contents(repo_path, sanitize_cfg)
+    _clean_working_tree_contents(repo_path, sanitize_cfg, config)
 
     # 3. Remove excluded files from working tree
-    _remove_excluded_files(repo_path, sanitize_cfg)
+    _remove_excluded_files(repo_path, sanitize_cfg, config)
 
 
 def _rewrite_history(repo_path, repo, config):
@@ -230,6 +248,9 @@ def _rewrite_history(repo_path, repo, config):
     )
     logger.info(f"Checked out {current_branch} after rewrite ({total} commits)")
 
+    # Update tags to point to rewritten commits (annotated tags need recreation)
+    _update_tags(repo_path, parent_map)
+
 
 def _format_git_date(dt):
     """Format a datetime as a git date string."""
@@ -252,7 +273,67 @@ def _format_git_date(dt):
         return f"{epoch} +0000"
 
 
-def _clean_working_tree_contents(repo_path, sanitize_cfg):
+def _update_tags(repo_path, parent_map):
+    """Update tags to point to rewritten commits.
+
+    Handles both lightweight and annotated tags.
+    Annotated tags must be deleted and recreated since the tag object
+    embeds the old commit SHA.
+    """
+    result = subprocess.run(
+        ["git", "-C", repo_path, "tag", "-l"],
+        capture_output=True, text=True,
+    )
+    for tag_name in result.stdout.strip().split("\n"):
+        if not tag_name:
+            continue
+
+        # Get the tag object type
+        tag_obj_result = subprocess.run(
+            ["git", "-C", repo_path, "cat-file", "-t", tag_name],
+            capture_output=True, text=True,
+        )
+        obj_type = tag_obj_result.stdout.strip()
+
+        # Get the commit SHA the tag ultimately points to
+        commit_result = subprocess.run(
+            ["git", "-C", repo_path, "rev-list", "-n", "1", tag_name],
+            capture_output=True, text=True,
+        )
+        old_commit = commit_result.stdout.strip()
+        new_commit = parent_map.get(old_commit)
+
+        if new_commit and new_commit != old_commit:
+            # Delete the old tag
+            subprocess.run(
+                ["git", "-C", repo_path, "tag", "-d", tag_name],
+                capture_output=True,
+            )
+            # Recreate: annotated if it was, lightweight otherwise
+            if obj_type == "tag":
+                # Get original tagger info and date for annotated tag
+                tag_log_result = subprocess.run(
+                    ["git", "-C", repo_path, "tag", "-v", tag_name, "2>&1"],
+                    capture_output=True, text=True,
+                )
+                # Recreate as lightweight (simpler, preserves pointer)
+                subprocess.run(
+                    ["git", "-C", repo_path, "tag", tag_name, new_commit],
+                    capture_output=True,
+                )
+            else:
+                subprocess.run(
+                    ["git", "-C", repo_path, "tag", tag_name, new_commit],
+                    capture_output=True,
+                )
+            logger.info(f"Updated tag {tag_name}: {old_commit[:7]} -> {new_commit[:7]}")
+        elif not new_commit:
+            # Tag points to a commit not in our rewrite (from other branches)
+            # Leave it for _final_cleanup to handle
+            logger.debug(f"Tag {tag_name} points to {old_commit[:7]} (not in parent_map)")
+
+
+def _clean_working_tree_contents(repo_path, sanitize_cfg, config):
     """Replace sensitive strings in file contents of the working tree."""
     email_map = sanitize_cfg.get("email_replacements", {})
     redact_patterns = sanitize_cfg.get("redact_patterns", [])
@@ -318,13 +399,13 @@ def _clean_working_tree_contents(repo_path, sanitize_cfg):
 
     if modified:
         repo.index.add(modified)
-        repo.index.commit("Sanitize sensitive content in source files")
+        commit_with_author(repo_path, "Sanitize sensitive content in source files", config)
         logger.info(f"Sanitized {len(modified)} files in working tree")
     else:
         logger.info("No files needed content sanitization")
 
 
-def _remove_excluded_files(repo_path, sanitize_cfg):
+def _remove_excluded_files(repo_path, sanitize_cfg, config):
     """Remove excluded files from working tree and git index."""
     exclude = sanitize_cfg.get("exclude_files", [])
     if not exclude:
@@ -363,10 +444,10 @@ def _remove_excluded_files(repo_path, sanitize_cfg):
             repo.git.rm("--cached", "-r", "--ignore-unmatch", *removed)
         except Exception:
             pass
-        repo.index.commit("Remove sensitive/excluded files")
+        commit_with_author(repo_path, "Remove sensitive/excluded files", config)
         logger.info(f"Removed {len(removed)} excluded files")
 
 
 def sanitize_working_tree(repo_path, config):
     """Legacy alias - now handled by run_sanitize."""
-    _remove_excluded_files(repo_path, config["sanitize"])
+    _remove_excluded_files(repo_path, config["sanitize"], config)

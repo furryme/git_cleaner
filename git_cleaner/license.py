@@ -70,7 +70,8 @@ def generate_license_files(repo_path, config):
     if generated:
         repo = __import__("git").Repo(repo_path)
         repo.index.add(generated)
-        repo.index.commit("Add project license and boilerplate files")
+        from .sanitize import commit_with_author
+        commit_with_author(repo_path, "Add project license and boilerplate files", config)
         logger.info(f"Committed {len(generated)} generated files")
 
     return generated
