@@ -104,9 +104,16 @@ def _squash_merge_commits(repo_path, cfg):
 
     logger.info(f"Found {len(merge_commits)} merge commits + {len(squash_commits)} squash-pattern commits")
 
-    # Use git rebase to drop merges
-    if merge_commits:
-        _rebase_drop_merges(repo, repo_path, cfg, squash_commits)
+    # If the first-parent chain is already linear (no merges on first-parent path),
+    # the sanitize step likely already produced a clean linear history — skip cherry-pick
+    first_parent_commits = list(repo.iter_commits("HEAD", first_parent=True))
+    fp_merges = [c for c in first_parent_commits if len(c.parents) > 1]
+    if not fp_merges:
+        logger.info("First-parent history already linear, nothing to relinearize")
+        return
+
+    if merge_commits or squash_commits:
+        _drop_merges_via_orphan(repo, repo_path, cfg, compiled)
     elif squash_commits:
         logger.info("Squash-pattern commits noted (use interactive rebase for manual cleanup)")
 
@@ -225,17 +232,30 @@ def _relinearize_from_commits(repo, repo_path, cfg):
 
     # Use git filter-branch to drop merge commits by changing parent refs
     # This is too complex, so let's use a proven approach
-    _drop_merges_via_orphan(repo, repo_path)
+    _drop_merges_via_orphan(repo, repo_path, cfg, compiled)
 
 
-def _drop_merges_via_orphan(repo, repo_path):
+def _drop_merges_via_orphan(repo, repo_path, cfg, squash_compiled=None):
     """Drop merge commits by creating a new linear branch via cherry-pick."""
     current_branch = repo.active_branch.name
+    squash_compiled = squash_compiled or []
 
-    # Get all non-merge commits in chronological order
-    all_commits = list(repo.iter_commits("--first-parent", "--reverse", "HEAD"))
+    # Get all commits in topological order, then drop merges and squash-pattern commits
+    seen = set()
+    all_commits = []
+    for c in repo.iter_commits("--topo-order", "--reverse", "HEAD"):
+        if c.hexsha in seen:
+            continue
+        seen.add(c.hexsha)
+        if len(c.parents) > 1:
+            continue
+        if any(p.search(c.message) for p in squash_compiled):
+            continue
+        all_commits.append(c)
     if not all_commits:
         return
+
+    logger.info(f"Rebuilding linear history with {len(all_commits)} commits (from {len(seen)} unique)")
 
     # Create orphan branch
     new_branch = f"_cleaner_linear_{__import__('time').time():.0f}"
@@ -244,23 +264,28 @@ def _drop_merges_via_orphan(repo, repo_path):
         repo.git.rm("-r", "--cached", "-f", ".")
 
         success_count = 0
+        empty_count = 0
         failed = []
         for commit in all_commits:
             try:
                 repo.git.cherry_pick(commit.hexsha, "--no-edit")
                 success_count += 1
             except Exception as e:
-                failed.append((commit.hexsha[:7], str(e)[:50]))
-                try:
-                    repo.git.cherry_pick("--abort")
-                except Exception:
-                    pass
+                err = str(e)
+                if "empty fixup" in err or "nothing to commit" in err:
+                    repo.git.cherry_pick("--drop")
+                    empty_count += 1
+                else:
+                    failed.append((commit.hexsha[:7], err[:50]))
+                    try:
+                        repo.git.cherry_pick("--abort")
+                    except Exception:
+                        pass
 
         if success_count > 0:
-            # Delete old branch and rename
             repo.git.branch("-D", current_branch)
             repo.git.branch("-m", new_branch, current_branch)
-            logger.info(f"Created linear history: {success_count} commits cherry-picked, {len(failed)} conflicts skipped")
+            logger.info(f"Linear history: {success_count} cherry-picked, {empty_count} empty, {len(failed)} conflicts")
             if failed:
                 logger.debug(f"Failed commits: {failed[:5]}")
         else:

@@ -335,10 +335,17 @@ def _rewrite_history(repo_path, repo, config, subs=None, exclude_patterns=None):
 
     new_branch = f"_cleaner_rewrite_{__import__('time').time():.0f}"
 
-    # Capture commits BEFORE any checkout changes
-    all_commits = list(repo.iter_commits(rev=current_branch, first_parent=True, reverse=True))
+    # Capture ALL commits (including merge branches) in topo-order, deduplicate
+    _seen = set()
+    all_commits = []
+    for c in repo.iter_commits(rev=current_branch, topo_order=True, reverse=True):
+        if c.hexsha in _seen:
+            continue
+        _seen.add(c.hexsha)
+        all_commits.append(c)
     total = len(all_commits)
-    logger.info(f"Rewriting {total} commits on {current_branch} via commit-tree...")
+    merges = sum(1 for c in all_commits if len(c.parents) > 1)
+    logger.info(f"Rewriting {total} commits on {current_branch} via commit-tree ({merges} merges will be linearized)...")
 
     # Use git commit-tree to create new commits with sanitized author info
     # This avoids cherry-pick conflicts and gives full control over author/committer
@@ -370,9 +377,17 @@ def _rewrite_history(repo_path, repo, config, subs=None, exclude_patterns=None):
             for regex, replacement in msg_subs:
                 new_msg = regex.sub(replacement, new_msg)
 
-            # Build parent refs
-            parent_shas = [parent_map.get(p.hexsha, p.hexsha) for p in commit.parents
-                          if p.hexsha in {c.hexsha for c in all_commits}]
+            # Build parent refs — for merge commits, keep the parent that's closest
+            # in our list (highest index = most recently rewritten, = feature branch tip)
+            # This ensures the feature branch commits remain reachable.
+            if len(commit.parents) > 1:
+                _parent_indices = {p.hexsha: all_commits.index(p) for p in commit.parents if p.hexsha in _seen}
+                best_parent = max(commit.parents, key=lambda p: _parent_indices.get(p.hexsha, -1))
+                _parents_to_keep = [best_parent]
+            else:
+                _parents_to_keep = list(commit.parents)
+            parent_shas = [parent_map.get(p.hexsha, p.hexsha) for p in _parents_to_keep
+                          if p.hexsha in _seen]
 
             # Create commit via commit-tree
             author_str = f'{a_name} <{a_email}>'
@@ -428,6 +443,7 @@ def _rewrite_history(repo_path, repo, config, subs=None, exclude_patterns=None):
         # Get the new HEAD SHA (last commit)
         old_head = all_commits[-1].hexsha if all_commits else None
         new_head = parent_map.get(old_head)
+        logger.info(f"Rewrote branch: HEAD {old_head[:7] if old_head else 'None'} -> {new_head[:7] if new_head else 'None'}")
 
         if new_head and new_head != old_head:
             # Create new branch at the rewritten HEAD
